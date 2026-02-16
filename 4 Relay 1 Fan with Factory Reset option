@@ -1,0 +1,577 @@
+/**********************************************************************************
+ * ESP32 RainMaker Modular Smart Home
+ * FEATURES: 
+ * 1. Default: BLE Provisioning (Fixes "Assisted Claiming" error)
+ * 2. Fallback: Hold BOOT button during startup for SoftAP
+ * 3. Web Portal Reset & App Remote Reset
+ **********************************************************************************/
+
+// ==========================================
+//      USER CONFIGURATION SECTION
+// ==========================================
+
+#define ENABLE_DHT      1   // 1 = Enable DHT Sensor
+#define ENABLE_IR       0   // 0 = Disable IR (Saves Memory)
+#define ENABLE_FAN      1   // 1 = Enable Fan Control
+#define ENABLE_DEBUG    1   // 1 = Print Logs
+
+#define DHTTYPE    DHT11    // DHT 11 Sensor
+
+// ==========================================
+//      END CONFIGURATION
+// ==========================================
+
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <Preferences.h>
+#include <AceButton.h>
+#include <SimpleTimer.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+#if ENABLE_IR
+  #include <IRremote.h>
+#endif
+#if ENABLE_DHT
+  #include <DHT.h>
+#endif
+
+using namespace ace_button;
+
+#if ENABLE_DEBUG
+  #define DEBUG_PRINT(...) Serial.printf(__VA_ARGS__)
+  #define DEBUG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#else
+  #define DEBUG_PRINT(...)
+  #define DEBUG_PRINTLN(...)
+#endif
+
+// --- GLOBALS ---
+char nodeName[] = "ESP32_SmartHome";
+char deviceName_1[] = "Switch1";
+char deviceName_2[] = "Switch2";
+char deviceName_3[] = "Switch3";
+char deviceName_4[] = "Switch4";
+#if ENABLE_FAN
+  char deviceName_5[] = "Fan";
+#endif
+
+// GPIO MAPPING
+static uint8_t RelayPin1 = 23;
+static uint8_t RelayPin2 = 22;
+static uint8_t RelayPin3 = 21;
+static uint8_t RelayPin4 = 19;
+
+static uint8_t SwitchPin1 = 13;
+static uint8_t SwitchPin2 = 12;
+static uint8_t SwitchPin3 = 14;
+static uint8_t SwitchPin4 = 27;
+static uint8_t SwitchPin5 = 26; 
+
+#if ENABLE_FAN
+  static uint8_t FanRelay1 = 18;
+  static uint8_t FanRelay2 = 5;
+  static uint8_t FanRelay3 = 25;
+  static uint8_t FanSwitch1 = 33;
+  static uint8_t FanSwitch2 = 32;
+  static uint8_t FanSwitch3 = 15;
+  static uint8_t FanSwitch4 = 4;
+#endif
+
+static uint8_t gpio_reset = 0; // BOOT Button
+static uint8_t wifiLed    = 2;
+
+// FEATURE PINS
+#if ENABLE_IR
+  static uint8_t IR_RECV_PIN = 35;
+  #define IR_Button_1   0x1FEE01F
+  #define IR_Button_2   0x1FE10EF
+  #define IR_Button_3   0x1FE906F
+  #define IR_Button_4   0x1FE50AF
+  #define IR_Button_5   0x1FED827
+  #define IR_Fan_Up     0x1FE609F
+  #define IR_Fan_Down   0x1FEA05F
+  #define IR_All_On     0x1FE807F
+  #define IR_All_Off    0x1FE48B7
+#endif
+
+#if ENABLE_DHT
+  static uint8_t DHTPIN = 16;
+#endif
+
+Preferences pref;
+SimpleTimer Timer;
+WebServer server(80);
+
+// Global Flag for Provisioning Mode
+bool use_ble_mode = true; 
+
+#if ENABLE_IR
+  IRrecv irrecv(IR_RECV_PIN);
+  decode_results results;
+#endif
+
+#if ENABLE_DHT
+  DHT dht(DHTPIN, DHTTYPE);
+  static TemperatureSensor temperature("Temperature");
+  static TemperatureSensor humidity("Humidity");
+#endif
+
+ButtonConfig config1; AceButton button1(&config1);
+ButtonConfig config2; AceButton button2(&config2);
+ButtonConfig config3; AceButton button3(&config3);
+ButtonConfig config4; AceButton button4(&config4);
+#if ENABLE_FAN
+  ButtonConfig config5; AceButton button5(&config5);
+#endif
+
+static Switch my_switch1(deviceName_1, &RelayPin1);
+static Switch my_switch2(deviceName_2, &RelayPin2);
+static Switch my_switch3(deviceName_3, &RelayPin3);
+static Switch my_switch4(deviceName_4, &RelayPin4);
+#if ENABLE_FAN
+  static Fan my_fan(deviceName_5);
+#endif
+
+// Variables
+bool toggleState_1 = LOW;
+bool toggleState_2 = LOW;
+bool toggleState_3 = LOW;
+bool toggleState_4 = LOW;
+
+#if ENABLE_FAN
+  int currSpeed = 0;
+  bool toggleState_5 = LOW;
+  bool fanSpeed_0 = LOW; bool fanSpeed_1 = LOW; 
+  bool fanSpeed_2 = LOW; bool fanSpeed_3 = LOW; bool fanSpeed_4 = LOW; 
+#endif
+
+float temperature1 = 0;
+float humidity1    = 0;
+bool first_run = true;
+
+const char *service_name = "PROV_Arunarudra";
+const char *pop = "arun1234";
+
+// --- WEB PORTAL ---
+const char* html_page = 
+"<!DOCTYPE html><html>"
+"<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+"<style>body{font-family:sans-serif;text-align:center;margin-top:50px;}"
+"button{background-color:red;color:white;padding:15px 32px;font-size:20px;border:none;border-radius:8px;cursor:pointer;}"
+"</style></head>"
+"<body><h1>ESP32 Smart Home</h1>"
+"<p>Device is working.</p>"
+"<form action=\"/reset\" method=\"POST\"><button type=\"submit\">FACTORY RESET</button></form>"
+"</body></html>";
+
+void handleRoot() { server.send(200, "text/html", html_page); }
+void handleResetRequest() {
+  server.send(200, "text/plain", "Resetting... Delete from App now.");
+  delay(1000);
+  RMakerFactoryReset(2);
+}
+
+// Forward Declarations
+void button1Handler(AceButton*, uint8_t, uint8_t);
+void button2Handler(AceButton*, uint8_t, uint8_t);
+void button3Handler(AceButton*, uint8_t, uint8_t);
+void button4Handler(AceButton*, uint8_t, uint8_t);
+#if ENABLE_FAN
+  void button5Handler(AceButton*, uint8_t, uint8_t);
+  void fanSpeedControl(int fanSpeed);
+  void fanRegularor();
+#endif
+void all_SwitchOff();
+void all_SwitchOn();
+
+// --- PROVISIONING EVENT ---
+void sysProvEvent(arduino_event_t *sys_event) {
+    switch (sys_event->event_id) {      
+        case ARDUINO_EVENT_PROV_START:
+            if (use_ble_mode) {
+              DEBUG_PRINT("\n[BLE] Provisioning Started. Name: \"%s\", PoP: \"%s\"\n", service_name, pop);
+              printQR(service_name, pop, "ble");
+            } else {
+              DEBUG_PRINT("\n[SoftAP] Provisioning Started. Connect to \"%s\", Password: (none)\n", service_name);
+              printQR(service_name, pop, "softap");
+            }
+        break;
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            DEBUG_PRINT("\nConnected to Wi-Fi!\n");
+            digitalWrite(wifiLed, true);
+        break;
+    }
+}
+
+// --- WRITE CALLBACK ---
+void write_callback(Device *device, Param *param, const param_val_t val, void *priv_data, write_ctx_t *ctx) {
+  const char *device_name = device->getDeviceName();
+  const char *param_name = param->getParamName();
+
+  // Remote Reset
+  if (strcmp(param_name, "Factory Reset") == 0) {
+      if (val.val.b == true) {
+          DEBUG_PRINTLN("\nRemote Reset Requested!");
+          param->updateAndReport(val);
+          delay(2000); 
+          RMakerFactoryReset(2);
+      }
+  }
+
+  // Switches
+  if(strcmp(device_name, deviceName_1) == 0) {
+    if(strcmp(param_name, "Power") == 0) {
+      DEBUG_PRINT("Switch1 Power: %s\n", val.val.b ? "ON" : "OFF");
+      toggleState_1 = val.val.b; digitalWrite(RelayPin1, !toggleState_1); 
+      param->updateAndReport(val); pref.putBool("Relay1", toggleState_1);
+    }
+  } 
+  else if(strcmp(device_name, deviceName_2) == 0) {
+    if(strcmp(param_name, "Power") == 0) {
+      DEBUG_PRINT("Switch2 Power: %s\n", val.val.b ? "ON" : "OFF");
+      toggleState_2 = val.val.b; digitalWrite(RelayPin2, !toggleState_2);
+      param->updateAndReport(val); pref.putBool("Relay2", toggleState_2);
+    }
+  } 
+  else if(strcmp(device_name, deviceName_3) == 0) {
+    if(strcmp(param_name, "Power") == 0) {
+      DEBUG_PRINT("Switch3 Power: %s\n", val.val.b ? "ON" : "OFF");
+      toggleState_3 = val.val.b; digitalWrite(RelayPin3, !toggleState_3);
+      param->updateAndReport(val); pref.putBool("Relay3", toggleState_3);
+    }
+  } 
+  else if(strcmp(device_name, deviceName_4) == 0) {
+    if(strcmp(param_name, "Power") == 0) {
+      DEBUG_PRINT("Switch4 Power: %s\n", val.val.b ? "ON" : "OFF");
+      toggleState_4 = val.val.b; digitalWrite(RelayPin4, !toggleState_4);
+      param->updateAndReport(val); pref.putBool("Relay4", toggleState_4);
+    }      
+  } 
+  #if ENABLE_FAN
+  else if(strcmp(device_name, deviceName_5) == 0) {
+    if (strcmp(param_name, "Power") == 0) {
+      DEBUG_PRINT("Fan Power: %s\n", val.val.b ? "ON" : "OFF");
+      toggleState_5 = val.val.b;
+      (toggleState_5 == false) ? fanSpeedControl(0) : fanSpeedControl(currSpeed);
+      param->updateAndReport(val); pref.putBool("Fan_Power", toggleState_5);
+    }  
+    if (strcmp(param_name, "My_Speed") == 0) {
+      DEBUG_PRINT("Fan Speed: %d\n", val.val.i);
+      currSpeed = val.val.i;
+      if(toggleState_5 == 1) fanSpeedControl(currSpeed);
+      param->updateAndReport(val); pref.putInt("Fan_Speed", currSpeed);
+    }
+  }
+  #endif
+}
+
+#if ENABLE_DHT
+void sendSensor() {
+  float h = dht.readHumidity(); float t = dht.readTemperature(); 
+  if (!isnan(h) && !isnan(t)) {
+    temperature.updateAndReportParam("Temperature", t);
+    humidity.updateAndReportParam("Temperature", h);
+  }  
+}
+#endif
+
+#if ENABLE_IR
+void ir_remote() {
+  if (irrecv.decode(&results)) {
+    static unsigned long last_ir = 0;
+    if(millis() - last_ir > 200) {
+      switch(results.value) {
+          case IR_Button_1: toggleState_1 = !toggleState_1; digitalWrite(RelayPin1, !toggleState_1); pref.putBool("Relay1", toggleState_1); my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_1); break;
+          case IR_Button_2: toggleState_2 = !toggleState_2; digitalWrite(RelayPin2, !toggleState_2); pref.putBool("Relay2", toggleState_2); my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_2); break;
+          case IR_Button_3: toggleState_3 = !toggleState_3; digitalWrite(RelayPin3, !toggleState_3); pref.putBool("Relay3", toggleState_3); my_switch3.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_3); break;
+          case IR_Button_4: toggleState_4 = !toggleState_4; digitalWrite(RelayPin4, !toggleState_4); pref.putBool("Relay4", toggleState_4); my_switch4.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_4); break;
+          #if ENABLE_FAN
+          case IR_Button_5: toggleState_5 = !toggleState_5; if(!toggleState_5) fanSpeedControl(0); else fanSpeedControl(currSpeed); pref.putBool("Fan_Power", toggleState_5); my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_5); break;
+          case IR_Fan_Up: if(currSpeed < 4 && toggleState_5){ currSpeed++; fanSpeedControl(currSpeed); pref.putInt("Fan_Speed", currSpeed); my_fan.updateAndReportParam("My_Speed", currSpeed); } break;
+          case IR_Fan_Down: if(currSpeed > 0 && toggleState_5){ currSpeed--; fanSpeedControl(currSpeed); pref.putInt("Fan_Speed", currSpeed); my_fan.updateAndReportParam("My_Speed", currSpeed); } break;
+          #endif
+          case IR_All_Off: all_SwitchOff(); break;
+          case IR_All_On:  all_SwitchOn(); break;
+          default: break;        
+      }
+      last_ir = millis();
+    }
+    irrecv.resume();   
+  } 
+}
+#endif
+
+void all_SwitchOff() {
+  toggleState_1 = 0; digitalWrite(RelayPin1, HIGH); pref.putBool("Relay1", 0); my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 0);
+  toggleState_2 = 0; digitalWrite(RelayPin2, HIGH); pref.putBool("Relay2", 0); my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 0);
+  toggleState_3 = 0; digitalWrite(RelayPin3, HIGH); pref.putBool("Relay3", 0); my_switch3.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 0);
+  toggleState_4 = 0; digitalWrite(RelayPin4, HIGH); pref.putBool("Relay4", 0); my_switch4.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 0);
+  #if ENABLE_FAN
+  toggleState_5 = 0; fanSpeedControl(0); pref.putBool("Fan_Power", 0); my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 0);
+  #endif
+}
+
+void all_SwitchOn() {
+  toggleState_1 = 1; digitalWrite(RelayPin1, LOW); pref.putBool("Relay1", 1); my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 1);
+  toggleState_2 = 1; digitalWrite(RelayPin2, LOW); pref.putBool("Relay2", 1); my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 1);
+  toggleState_3 = 1; digitalWrite(RelayPin3, LOW); pref.putBool("Relay3", 1); my_switch3.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 1);
+  toggleState_4 = 1; digitalWrite(RelayPin4, LOW); pref.putBool("Relay4", 1); my_switch4.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 1);
+  #if ENABLE_FAN
+  toggleState_5 = 1; fanSpeedControl(currSpeed); pref.putBool("Fan_Power", 1); my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, 1);
+  #endif
+}
+
+void getRelayState() {
+  toggleState_1 = pref.getBool("Relay1", 0); digitalWrite(RelayPin1, !toggleState_1); my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_1); delay(100);
+  toggleState_2 = pref.getBool("Relay2", 0); digitalWrite(RelayPin2, !toggleState_2); my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_2); delay(100);
+  toggleState_3 = pref.getBool("Relay3", 0); digitalWrite(RelayPin3, !toggleState_3); my_switch3.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_3); delay(100);
+  toggleState_4 = pref.getBool("Relay4", 0); digitalWrite(RelayPin4, !toggleState_4); my_switch4.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_4); delay(100);
+  #if ENABLE_FAN
+    currSpeed = pref.getInt("Fan_Speed", 0); my_fan.updateAndReportParam("My_Speed", currSpeed); delay(100);
+    toggleState_5 = pref.getBool("Fan_Power", 0); 
+    if(toggleState_5 && currSpeed > 0) fanSpeedControl(currSpeed);
+    my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_5); delay(100);
+  #endif
+}
+
+// --------------------------------------------------------------------------
+//   SETUP
+// --------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  pref.begin("Relay_State", false);
+  
+  // GPIO Init
+  pinMode(RelayPin1, OUTPUT); pinMode(RelayPin2, OUTPUT);
+  pinMode(RelayPin3, OUTPUT); pinMode(RelayPin4, OUTPUT);
+  pinMode(wifiLed, OUTPUT);
+  pinMode(SwitchPin1, INPUT_PULLUP); pinMode(SwitchPin2, INPUT_PULLUP);
+  pinMode(SwitchPin3, INPUT_PULLUP); pinMode(SwitchPin4, INPUT_PULLUP);
+  pinMode(gpio_reset, INPUT); // GPIO 0 (Boot Button)
+
+  digitalWrite(RelayPin1, !toggleState_1); digitalWrite(RelayPin2, !toggleState_2);
+  digitalWrite(RelayPin3, !toggleState_3); digitalWrite(RelayPin4, !toggleState_4);
+  digitalWrite(wifiLed, LOW);
+
+  // --- SMART MODE SELECTOR ---
+  // If BOOT button is held during startup -> Force SoftAP Mode
+  // Otherwise -> Use BLE (Default)
+  if (digitalRead(gpio_reset) == LOW) {
+    delay(100); // Debounce
+    if (digitalRead(gpio_reset) == LOW) {
+      use_ble_mode = false;
+      DEBUG_PRINTLN("\n[MODE] BOOT Button Held -> Starting in SoftAP Mode!");
+      // Flash LED to indicate SoftAP mode triggered
+      for(int i=0; i<5; i++) { digitalWrite(wifiLed, !digitalRead(wifiLed)); delay(100); }
+    }
+  } else {
+    use_ble_mode = true;
+    DEBUG_PRINTLN("\n[MODE] Starting in BLE Mode (Default)");
+  }
+  // ---------------------------
+
+  config1.setEventHandler(button1Handler); button1.init(SwitchPin1);
+  config2.setEventHandler(button2Handler); button2.init(SwitchPin2);
+  config3.setEventHandler(button3Handler); button3.init(SwitchPin3);
+  config4.setEventHandler(button4Handler); button4.init(SwitchPin4);
+
+  #if ENABLE_FAN
+    pinMode(FanRelay1, OUTPUT); pinMode(FanRelay2, OUTPUT); pinMode(FanRelay3, OUTPUT);
+    digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH);
+    pinMode(FanSwitch1, INPUT_PULLUP); pinMode(FanSwitch2, INPUT_PULLUP);
+    pinMode(FanSwitch3, INPUT_PULLUP); pinMode(FanSwitch4, INPUT_PULLUP);
+    pinMode(SwitchPin5, INPUT_PULLUP);
+    config5.setEventHandler(button5Handler); button5.init(SwitchPin5);
+  #endif
+
+  #if ENABLE_IR
+    irrecv.enableIRIn(); 
+  #endif
+  #if ENABLE_DHT
+    dht.begin();    
+  #endif
+
+  Node my_node;    
+  my_node = RMaker.initNode(nodeName);
+
+  my_switch1.addCb(write_callback); 
+  // Add Reset Toggle
+  Param resetParam("Factory Reset", ESP_RMAKER_PARAM_TOGGLE, value(false), PROP_FLAG_READ | PROP_FLAG_WRITE);
+  resetParam.addUIType(ESP_RMAKER_UI_TOGGLE);
+  my_switch1.addParam(resetParam);
+  my_node.addDevice(my_switch1);
+
+  my_switch2.addCb(write_callback); my_node.addDevice(my_switch2);
+  my_switch3.addCb(write_callback); my_node.addDevice(my_switch3);
+  my_switch4.addCb(write_callback); my_node.addDevice(my_switch4);
+
+  #if ENABLE_FAN
+    my_fan.addCb(write_callback);
+    Param speed("My_Speed", ESP_RMAKER_PARAM_RANGE, value(0), PROP_FLAG_READ | PROP_FLAG_WRITE);
+    speed.addBounds(value(0), value(4), value(1));
+    speed.addUIType(ESP_RMAKER_UI_SLIDER);
+    my_fan.addParam(speed);
+    my_node.addDevice(my_fan);
+  #endif
+
+  #if ENABLE_DHT
+    my_node.addDevice(temperature); my_node.addDevice(humidity);
+    Timer.setInterval(30000); 
+  #endif
+
+  RMaker.enableTZService();
+  RMaker.enableSchedule();
+
+  DEBUG_PRINTLN("\nStarting ESP-RainMaker\n");
+  RMaker.start();
+  WiFi.onEvent(sysProvEvent);
+  
+  // --- DUAL PROVISIONING LOGIC ---
+  if (use_ble_mode) {
+    #if CONFIG_IDF_TARGET_ESP32
+      WiFiProv.beginProvision(WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BTDM, WIFI_PROV_SECURITY_1, pop, service_name);
+    #else
+      WiFiProv.beginProvision(WIFI_PROV_SCHEME_SOFTAP, WIFI_PROV_SCHEME_HANDLER_NONE, WIFI_PROV_SECURITY_1, pop, service_name);
+    #endif
+  } else {
+      WiFiProv.beginProvision(WIFI_PROV_SCHEME_SOFTAP, WIFI_PROV_SCHEME_HANDLER_NONE, WIFI_PROV_SECURITY_1, pop, service_name);
+  }
+
+  // Web Portal
+  if (MDNS.begin("espsmart")) { Serial.println("MDNS started"); }
+  server.on("/", handleRoot);
+  server.on("/reset", handleResetRequest);
+  server.begin();
+
+  delay(200);
+  getRelayState();
+}
+
+// --------------------------------------------------------------------------
+//   LOOP
+// --------------------------------------------------------------------------
+void loop() {  
+  server.handleClient(); // Web Portal
+  
+  if(digitalRead(gpio_reset) == LOW) { 
+    delay(100); int startTime = millis();
+    while(digitalRead(gpio_reset) == LOW) delay(50);
+    int endTime = millis();
+    if ((endTime - startTime) > 10000) { RMakerFactoryReset(2); } 
+    else if ((endTime - startTime) > 3000) { RMakerWiFiReset(2); }
+  }
+
+  if (WiFi.status() != WL_CONNECTED) { digitalWrite(wifiLed, false); } 
+  else { 
+    digitalWrite(wifiLed, true);
+    #if ENABLE_DHT
+    if (Timer.isReady()) { sendSensor(); Timer.reset(); }
+    #endif
+  }
+
+  button1.check(); button2.check(); button3.check(); button4.check();
+  #if ENABLE_FAN
+    button5.check(); fanRegularor(); 
+  #endif
+  #if ENABLE_IR
+    ir_remote(); 
+  #endif
+}
+
+// --------------------------------------------------------------------------
+//   FAN CONTROLLER & BUTTONS
+// --------------------------------------------------------------------------
+#if ENABLE_FAN
+void fanRegularor() {
+  if (digitalRead(FanSwitch1) && digitalRead(FanSwitch2) && digitalRead(FanSwitch3) && digitalRead(FanSwitch4) && !fanSpeed_0) {
+    if(!first_run) { currSpeed = 0; if(toggleState_5) fanSpeedControl(currSpeed); pref.putInt("Fan_Speed", currSpeed); my_fan.updateAndReportParam("My_Speed", currSpeed); }    
+    fanSpeed_1=0; fanSpeed_2=0; fanSpeed_3=0; fanSpeed_4=0; fanSpeed_0=1;
+  }
+  if (!digitalRead(FanSwitch1) && !fanSpeed_1) {
+    if(!first_run) { currSpeed = 1; if(toggleState_5) fanSpeedControl(currSpeed); pref.putInt("Fan_Speed", currSpeed); my_fan.updateAndReportParam("My_Speed", currSpeed); }
+    fanSpeed_1=1; fanSpeed_2=0; fanSpeed_3=0; fanSpeed_4=0; fanSpeed_0=0;
+  }
+  if (!digitalRead(FanSwitch2) && digitalRead(FanSwitch3) && !fanSpeed_2) {
+    if(!first_run) { currSpeed = 2; if(toggleState_5) fanSpeedControl(currSpeed); pref.putInt("Fan_Speed", currSpeed); my_fan.updateAndReportParam("My_Speed", currSpeed); }
+    fanSpeed_1=0; fanSpeed_2=1; fanSpeed_3=0; fanSpeed_4=0; fanSpeed_0=0;
+  }
+  if (!digitalRead(FanSwitch2) && !digitalRead(FanSwitch3) && !fanSpeed_3) {
+    if(!first_run) { currSpeed = 3; if(toggleState_5) fanSpeedControl(currSpeed); pref.putInt("Fan_Speed", currSpeed); my_fan.updateAndReportParam("My_Speed", currSpeed); }
+    fanSpeed_1=0; fanSpeed_2=0; fanSpeed_3=1; fanSpeed_4=0; fanSpeed_0=0;
+  }
+  if (!digitalRead(FanSwitch4) && !fanSpeed_4) {
+    if(!first_run) { currSpeed = 4; if(toggleState_5) fanSpeedControl(currSpeed); pref.putInt("Fan_Speed", currSpeed); my_fan.updateAndReportParam("My_Speed", currSpeed); }
+    fanSpeed_1=0; fanSpeed_2=0; fanSpeed_3=0; fanSpeed_4=1; fanSpeed_0=0;
+  }
+  first_run = false;
+}
+
+void fanSpeedControl(int fanSpeed) {
+   switch(fanSpeed){
+    case 0: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); break;
+    case 1: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); delay(300); digitalWrite(FanRelay1, LOW); break;
+    case 2: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); delay(300); digitalWrite(FanRelay2, LOW); break;
+    case 3: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); delay(300); digitalWrite(FanRelay1, LOW); digitalWrite(FanRelay2, LOW); break;
+    case 4: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); delay(300); digitalWrite(FanRelay3, LOW); break;
+   } 
+}
+#endif
+
+void button1Handler(AceButton* b, uint8_t type, uint8_t s) { 
+  if(type==AceButton::kEventPressed){
+    DEBUG_PRINTLN("Button 1 Pressed -> ON"); // <--- ADDED LOG
+    toggleState_1=1; digitalWrite(RelayPin1,LOW);
+  } else {
+    DEBUG_PRINTLN("Button 1 Released -> OFF"); // <--- ADDED LOG
+    toggleState_1=0; digitalWrite(RelayPin1,HIGH);
+  } 
+  pref.putBool("Relay1", toggleState_1); 
+  my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_1); 
+}
+
+void button2Handler(AceButton* b, uint8_t type, uint8_t s) { 
+  if(type==AceButton::kEventPressed){
+    DEBUG_PRINTLN("Button 2 Pressed -> ON"); // <--- ADDED LOG
+    toggleState_2=1; digitalWrite(RelayPin2,LOW);
+  } else {
+    DEBUG_PRINTLN("Button 2 Released -> OFF"); // <--- ADDED LOG
+    toggleState_2=0; digitalWrite(RelayPin2,HIGH);
+  } 
+  pref.putBool("Relay2", toggleState_2); 
+  my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_2); 
+}
+
+void button3Handler(AceButton* b, uint8_t type, uint8_t s) { 
+  if(type==AceButton::kEventPressed){
+    DEBUG_PRINTLN("Button 3 Pressed -> ON"); // <--- ADDED LOG
+    toggleState_3=1; digitalWrite(RelayPin3,LOW);
+  } else {
+    DEBUG_PRINTLN("Button 3 Released -> OFF"); // <--- ADDED LOG
+    toggleState_3=0; digitalWrite(RelayPin3,HIGH);
+  } 
+  pref.putBool("Relay3", toggleState_3); 
+  my_switch3.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_3); 
+}
+
+void button4Handler(AceButton* b, uint8_t type, uint8_t s) { 
+  if(type==AceButton::kEventPressed){
+    DEBUG_PRINTLN("Button 4 Pressed -> ON"); // <--- ADDED LOG
+    toggleState_4=1; digitalWrite(RelayPin4,LOW);
+  } else {
+    DEBUG_PRINTLN("Button 4 Released -> OFF"); // <--- ADDED LOG
+    toggleState_4=0; digitalWrite(RelayPin4,HIGH);
+  } 
+  pref.putBool("Relay4", toggleState_4); 
+  my_switch4.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_4); 
+}
+
+
+#if ENABLE_FAN
+void button5Handler(AceButton* b, uint8_t type, uint8_t s) { 
+  if(type==AceButton::kEventPressed) { toggleState_5=1; fanSpeedControl(currSpeed); } 
+  else { toggleState_5=0; fanSpeedControl(0); }
+  pref.putBool("Fan_Power", toggleState_5); my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_5); 
+}
+#endif
