@@ -1,0 +1,1036 @@
+/**********************************************************************************
+ * ESP32 Smart Home | MQTT Production Architecture (Fixed & Hardened)
+ * * FEATURES: 
+ * - Option B Pairing: Listens for {"type":"paired"} on .../event topic
+ * - Stability: LWT (Last Will), Keepalive, and Exponential Backoff Reconnect
+ * - Memory Safety: Heap guards on all heavy JSON operations
+ **********************************************************************************/
+
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <Preferences.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <WiFiClient.h> 
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "esp_bt.h" 
+#include <esp_task_wdt.h>
+#include <esp_event.h>
+#include <esp_rmaker_ota.h>
+
+#ifdef __has_include
+  #if __has_include("mqtt_secrets.h")
+    #include "mqtt_secrets.h"
+  #endif
+#endif
+
+#define ENABLE_FAN      1   
+#define WDT_TIMEOUT     20  
+#define SAFE_HEAP_MIN   35000 // Conservative heap limit
+#define MQTT_MAX_JSON_PAYLOAD 480
+#define MQTT_RXTX_BUFFER_SIZE 384
+#define BT_RELEASE_DELAY_MS 30000
+#define RMAKER_FW_VERSION "1.0.2"
+#define RMAKER_MODEL "OurDeals-4CH"
+
+// --- MQTT Configuration ---
+#ifndef MQTT_BROKER_HOST
+  #define MQTT_BROKER_HOST "broker.hivemq.com"
+#endif
+#ifndef MQTT_BROKER_PORT
+  #define MQTT_BROKER_PORT 1883
+#endif
+#ifndef MQTT_USE_TLS
+  #define MQTT_USE_TLS 0
+#endif
+#ifndef MQTT_USERNAME
+  #define MQTT_USERNAME ""
+#endif
+#ifndef MQTT_PASSWORD
+  #define MQTT_PASSWORD ""
+#endif
+#ifndef MQTT_REQUIRE_AUTH
+  #define MQTT_REQUIRE_AUTH 0
+#endif
+#ifndef MQTT_CA_CERT
+  #define MQTT_CA_CERT ""
+#endif
+#ifndef MQTT_REQUIRE_CMD_TOKEN
+  #define MQTT_REQUIRE_CMD_TOKEN 0
+#endif
+#ifndef MQTT_CMD_TOKEN
+  #define MQTT_CMD_TOKEN ""
+#endif
+#ifndef PAIR_CONFIRM_REQUIRE_CODE
+  #define PAIR_CONFIRM_REQUIRE_CODE 0
+#endif
+#ifndef MDNS_HOSTNAME
+  #define MDNS_HOSTNAME "espsmart"
+#endif
+#ifndef PORTAL_USER
+  #define PORTAL_USER "admin"
+#endif
+#ifndef PORTAL_PASS
+  #define PORTAL_PASS "admin"
+#endif
+
+const char* MQTT_BROKER = MQTT_BROKER_HOST;
+const int   MQTT_PORT   = MQTT_BROKER_PORT; 
+const char* MQTT_PREFIX = "ourdeals_iot/";
+
+Preferences pref;
+WebServer server(80);
+Node my_node; 
+
+// --- Global Client & MQTT ---
+#if MQTT_USE_TLS
+WiFiClientSecure mqttNetClient;
+#else
+WiFiClient mqttNetClient;
+#endif
+PubSubClient mqtt(mqttNetClient);
+
+// Variables
+String chat_id     = "";  
+String device_id   = "";  
+String device_name = "Smart Device"; 
+long pairing_code  = 0;
+bool is_paired     = false;
+bool use_ble_mode  = true; 
+char mqttClientId[48];
+char topic_cmd[96];
+char topic_event[96];
+char topic_state[96];
+char topic_config[96];
+char topic_online[96];
+
+// Timers & State
+bool pairing_active = false;
+unsigned long pairing_timer = 0;
+unsigned long last_beacon = 0;
+bool bt_killed = false;
+unsigned long wifi_connect_time = 0;
+bool mdns_started = false;
+bool provisioning_in_progress = false;
+bool ota_in_progress = false;
+bool ota_paused_portal = false;
+
+// Reconnect Logic
+unsigned long last_reconnect_attempt = 0;
+unsigned long reconnect_interval = 1000; // Start with 1s
+
+// RainMaker Config (Keep for Provisioning)
+char nodeName[] = "SmartHome 4 Switches";
+char deviceName_1[] = "Switch1";
+char deviceName_2[] = "Switch2";
+char deviceName_3[] = "Switch3";
+char deviceName_4[] = "Switch4";
+const char *service_name = "PROV_ArunArudra"; 
+const char *pop = "arun1234";
+
+// GPIO Setup
+static uint8_t RelayPin1 = 23; static uint8_t RelayPin2 = 22; static uint8_t RelayPin3 = 21; static uint8_t RelayPin4 = 19;
+static uint8_t SwitchPin1 = 13; static uint8_t SwitchPin2 = 12; static uint8_t SwitchPin3 = 14; static uint8_t SwitchPin4 = 27;
+static uint8_t SwitchPin5 = 26; static uint8_t gpio_reset = 0; static uint8_t wifiLed = 2;
+
+// Devices
+static Switch my_switch1(deviceName_1, &RelayPin1);
+static Switch my_switch2(deviceName_2, &RelayPin2);
+static Switch my_switch3(deviceName_3, &RelayPin3);
+static Switch my_switch4(deviceName_4, &RelayPin4);
+
+#if ENABLE_FAN
+  char deviceName_5[] = "Fan";
+  static Fan my_fan(deviceName_5);
+  static uint8_t FanRelay1 = 18; static uint8_t FanRelay2 = 5; static uint8_t FanRelay3 = 25;
+  static uint8_t FanSwitch1 = 33; static uint8_t FanSwitch2 = 32; static uint8_t FanSwitch3 = 15; static uint8_t FanSwitch4 = 4;
+#endif
+
+bool toggleState_1=0; bool toggleState_2=0; bool toggleState_3=0; bool toggleState_4=0;
+#if ENABLE_FAN
+  int currSpeed = 0; bool toggleState_5 = 0;
+  bool fanSpeed_0=0; bool fanSpeed_1=0; bool fanSpeed_2=0; bool fanSpeed_3=0; bool fanSpeed_4=0;
+  int pendingFanSpeed = 0;
+  bool fanTransitionActive = false;
+  unsigned long fanTransitionStart = 0;
+  const unsigned long FAN_SETTLE_MS = 300;
+  bool first_run = true;
+  void fanSpeedControl(int s); void fanRegularor(); void fanService();
+#endif
+
+// Forward Declarations
+void buildMqttTopics();
+void releaseBluetoothResources();
+bool isValidCommandToken(JsonDocument& req);
+void publishState();
+void pollRockerSwitches();
+bool readDebouncedInput(uint8_t pin);
+void applyBootRelayStateWithoutFlicker();
+void otaEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+
+const uint8_t rockerPins[4] = {SwitchPin1, SwitchPin2, SwitchPin3, SwitchPin4};
+const uint8_t rockerIds[4] = {1, 2, 3, 4};
+const char* relayPrefKeys[4] = {"Relay1", "Relay2", "Relay3", "Relay4"};
+const char* rockerLevelPrefKeys[4] = {"SwL1", "SwL2", "SwL3", "SwL4"};
+bool rockerLastRaw[4] = {HIGH, HIGH, HIGH, HIGH};
+bool rockerStable[4] = {HIGH, HIGH, HIGH, HIGH};
+unsigned long rockerLastEdgeMs[4] = {0, 0, 0, 0};
+const unsigned long ROCKER_DEBOUNCE_MS = 20;
+
+// ==========================================
+//      MQTT LOGIC (Protocol Correct)
+// ==========================================
+
+void initRelayOutputsSafeOff() {
+  pinMode(RelayPin1, OUTPUT); pinMode(RelayPin2, OUTPUT); pinMode(RelayPin3, OUTPUT); pinMode(RelayPin4, OUTPUT);
+  digitalWrite(RelayPin1, HIGH); digitalWrite(RelayPin2, HIGH); digitalWrite(RelayPin3, HIGH); digitalWrite(RelayPin4, HIGH);
+  #if ENABLE_FAN
+  pinMode(FanRelay1, OUTPUT); pinMode(FanRelay2, OUTPUT); pinMode(FanRelay3, OUTPUT);
+  digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH);
+  #endif
+}
+
+void releaseBluetoothResources() {
+  if (bt_killed) return;
+  btStop();
+  esp_bt_controller_disable();
+  esp_bt_controller_deinit();
+  bt_killed = true;
+}
+
+bool isValidCommandToken(JsonDocument& req) {
+  #if MQTT_REQUIRE_CMD_TOKEN
+    if (strlen(MQTT_CMD_TOKEN) == 0) return false;
+    if (!req.containsKey("token")) return false;
+    const char* token = req["token"];
+    if (!token) return false;
+    return strcmp(token, MQTT_CMD_TOKEN) == 0;
+  #else
+    (void)req;
+    return true;
+  #endif
+}
+
+void buildMqttTopics() {
+  snprintf(topic_cmd, sizeof(topic_cmd), "%s%s/cmd", MQTT_PREFIX, device_id.c_str());
+  snprintf(topic_event, sizeof(topic_event), "%s%s/event", MQTT_PREFIX, device_id.c_str());
+  snprintf(topic_state, sizeof(topic_state), "%s%s/state", MQTT_PREFIX, device_id.c_str());
+  snprintf(topic_config, sizeof(topic_config), "%s%s/config", MQTT_PREFIX, device_id.c_str());
+  snprintf(topic_online, sizeof(topic_online), "%s%s/online", MQTT_PREFIX, device_id.c_str());
+}
+
+void safePublish(const char* topic, StaticJsonDocument<256>& doc, bool retain = false) {
+  if (ESP.getFreeHeap() < SAFE_HEAP_MIN || !mqtt.connected()) return;
+  char buf[MQTT_MAX_JSON_PAYLOAD];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  if (n == 0 || n >= sizeof(buf)) return;
+  mqtt.publish(topic, (const uint8_t*)buf, n, retain);
+}
+
+void applySwitchState(int switch_num, bool new_state) {
+  if (switch_num == 1) {
+    toggleState_1 = new_state;
+    digitalWrite(RelayPin1, !toggleState_1);
+    pref.putBool("Relay1", toggleState_1);
+    my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_1);
+  } else if (switch_num == 2) {
+    toggleState_2 = new_state;
+    digitalWrite(RelayPin2, !toggleState_2);
+    pref.putBool("Relay2", toggleState_2);
+    my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_2);
+  } else if (switch_num == 3) {
+    toggleState_3 = new_state;
+    digitalWrite(RelayPin3, !toggleState_3);
+    pref.putBool("Relay3", toggleState_3);
+    my_switch3.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_3);
+  } else if (switch_num == 4) {
+    toggleState_4 = new_state;
+    digitalWrite(RelayPin4, !toggleState_4);
+    pref.putBool("Relay4", toggleState_4);
+    my_switch4.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_4);
+  }
+}
+
+bool readDebouncedInput(uint8_t pin) {
+  bool first = digitalRead(pin);
+  delay(5);
+  bool second = digitalRead(pin);
+  if (first == second) return second;
+  delay(5);
+  return digitalRead(pin);
+}
+
+void applyBootRelayStateWithoutFlicker() {
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    bool currentLevel = readDebouncedInput(rockerPins[i]);
+    bool storedRelayState = pref.getBool(relayPrefKeys[i], false);
+
+    bool usePhysicalState = false;
+    if (pref.isKey(rockerLevelPrefKeys[i])) {
+      bool lastBootLevel = pref.getBool(rockerLevelPrefKeys[i], currentLevel);
+      usePhysicalState = (lastBootLevel != currentLevel);
+    }
+
+    bool targetRelayState = usePhysicalState ? (currentLevel == LOW) : storedRelayState;
+    applySwitchState(rockerIds[i], targetRelayState);
+
+    rockerLastRaw[i] = currentLevel;
+    rockerStable[i] = currentLevel;
+    rockerLastEdgeMs[i] = now;
+    pref.putBool(rockerLevelPrefKeys[i], currentLevel);
+  }
+}
+
+void pollRockerSwitches() {
+  bool stateChanged = false;
+  unsigned long now = millis();
+
+  for (int i = 0; i < 4; i++) {
+    bool raw = digitalRead(rockerPins[i]);
+
+    if (raw != rockerLastRaw[i]) {
+      rockerLastRaw[i] = raw;
+      rockerLastEdgeMs[i] = now;
+    }
+
+    if ((now - rockerLastEdgeMs[i]) >= ROCKER_DEBOUNCE_MS && raw != rockerStable[i]) {
+      rockerStable[i] = raw;
+      bool logicalState = (rockerStable[i] == LOW); // INPUT_PULLUP: LOW means switch ON.
+      applySwitchState(rockerIds[i], logicalState);
+      pref.putBool(rockerLevelPrefKeys[i], rockerStable[i]);
+      stateChanged = true;
+    }
+  }
+
+  if (stateChanged) {
+    publishState();
+  }
+}
+
+void otaEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+  (void)arg;
+  (void)event_data;
+  if (event_base != RMAKER_OTA_EVENT) return;
+
+  if (event_id == RMAKER_OTA_EVENT_STARTING) {
+    ota_in_progress = true;
+    if (mqtt.connected()) mqtt.disconnect();
+    mqttNetClient.stop();
+    if (!ota_paused_portal) {
+      server.stop();
+      if (mdns_started) {
+        MDNS.end();
+        mdns_started = false;
+      }
+      ota_paused_portal = true;
+    }
+    delay(30); // Allow sockets/tasks to release buffers before OTA TLS starts.
+    Serial.printf("OTA prep heap: free=%u max=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    return;
+  }
+
+  if (event_id == RMAKER_OTA_EVENT_FAILED || event_id == RMAKER_OTA_EVENT_REJECTED) {
+    ota_in_progress = false;
+    if (ota_paused_portal) {
+      server.begin();
+      if (WiFi.status() == WL_CONNECTED && MDNS.begin(MDNS_HOSTNAME)) {
+        MDNS.addService("http", "tcp", 80);
+        mdns_started = true;
+      }
+      ota_paused_portal = false;
+    }
+    Serial.printf("OTA failed/rejected heap: free=%u max=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    return;
+  }
+
+  if (event_id == RMAKER_OTA_EVENT_SUCCESSFUL) {
+    ota_in_progress = true;
+  }
+}
+
+void publishState() {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "state";
+  doc["ts"] = millis() / 1000;
+  doc["s1"] = toggleState_1;
+  doc["s2"] = toggleState_2;
+  doc["s3"] = toggleState_3;
+  doc["s4"] = toggleState_4;
+  #if ENABLE_FAN
+  doc["fan_pwr"] = toggleState_5;
+  doc["fan_spd"] = currSpeed;
+  #endif
+  
+  // Retained state so backend gets it immediately on reconnect
+  safePublish(topic_state, doc, true);
+}
+
+void sendMqttLog(String msg) {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "log";
+  doc["msg"] = msg;
+  safePublish(topic_event, doc, false);
+}
+
+void sendPairingBeaconMQTT() {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "pair";
+  doc["msg"] = String(pairing_code);
+  safePublish(topic_event, doc, false);
+}
+
+void sendRenameEventMQTT() {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "rename";
+  doc["msg"] = device_name;
+  safePublish(topic_event, doc, false);
+}
+
+void sendUnlinkEventMQTT() {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "unlink";
+  doc["msg"] = "local_unlink";
+  safePublish(topic_event, doc, false);
+}
+
+void sendResetEventMQTT() {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "reset";
+  doc["msg"] = "factory_reset";
+  safePublish(topic_event, doc, false);
+}
+
+void publishHardwareConfigMQTT() {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "config";
+  doc["relays"] = 4;
+  #if ENABLE_FAN
+  doc["fan"] = true;
+  doc["fan_speed_levels"] = 4;
+  #else
+  doc["fan"] = false;
+  #endif
+  safePublish(topic_config, doc, true);
+}
+
+bool handleLegacySwitchCmd(const String& cmd) {
+  if (!cmd.startsWith("s")) return false;
+  int us = cmd.indexOf('_');
+  if (us <= 1) return false;
+
+  int switch_num = cmd.substring(1, us).toInt();
+  String action = cmd.substring(us + 1);
+  if (action == "on") {
+    applySwitchState(switch_num, true);
+    return true;
+  }
+  if (action == "off") {
+    applySwitchState(switch_num, false);
+    return true;
+  }
+  return false;
+}
+
+bool handleCmdString(const String& cmd, JsonVariantConst req) {
+  if (cmd == "Factory Reset" || cmd == "factory_reset") {
+    sendResetEventMQTT();
+    delay(100);
+    RMakerFactoryReset(2);
+    return false;
+  }
+
+  if (cmd == "unlink") {
+    pref.remove("chat_id");
+    chat_id = "";
+    is_paired = false;
+    pairing_active = false;
+    sendUnlinkEventMQTT();
+    return false;
+  }
+
+  if (cmd.startsWith("name:")) {
+    String new_name = cmd.substring(5);
+    new_name.trim();
+    if (new_name.length() > 0) {
+      device_name = new_name;
+      pref.putString("dev_name", device_name);
+      sendRenameEventMQTT();
+    }
+    return false;
+  }
+
+  if (cmd == "rename") {
+    if (req.containsKey("name")) {
+      String new_name = req["name"].as<String>();
+      new_name.trim();
+      if (new_name.length() > 0) {
+        device_name = new_name;
+        pref.putString("dev_name", device_name);
+        sendRenameEventMQTT();
+      }
+    }
+    return false;
+  }
+
+  #if ENABLE_FAN
+  if (cmd == "fan_on") {
+    toggleState_5 = true;
+    if (currSpeed <= 0) currSpeed = 1;
+    fanSpeedControl(currSpeed);
+    pref.putBool("Fan_Power", toggleState_5);
+    pref.putInt("Fan_Speed", currSpeed);
+    my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_5);
+    my_fan.updateAndReportParam("My_Speed", currSpeed);
+    return true;
+  }
+  if (cmd == "fan_off") {
+    toggleState_5 = false;
+    fanSpeedControl(0);
+    pref.putBool("Fan_Power", toggleState_5);
+    my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_5);
+    return true;
+  }
+  if (cmd.startsWith("fan_spd_")) {
+    int spd = cmd.substring(8).toInt();
+    if (spd < 0) spd = 0;
+    if (spd > 4) spd = 4;
+    currSpeed = spd;
+    pref.putInt("Fan_Speed", currSpeed);
+    my_fan.updateAndReportParam("My_Speed", currSpeed);
+    if (toggleState_5) fanSpeedControl(currSpeed);
+    return true;
+  }
+  #endif
+
+  return handleLegacySwitchCmd(cmd);
+}
+
+// OPTION B: Handle BOTH Commands and Pairing Events
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  if (len == 0 || len > MQTT_MAX_JSON_PAYLOAD) return;
+  bool is_cmd_topic = strcmp(topic, topic_cmd) == 0;
+  bool is_event_topic = strcmp(topic, topic_event) == 0;
+  if (!is_cmd_topic && !is_event_topic) return;
+
+  StaticJsonDocument<512> req;
+  DeserializationError err = deserializeJson(req, payload, len);
+  if (err) return;
+
+  if (is_event_topic && req.containsKey("type") && strcmp(req["type"], "paired") == 0) {
+      if (!isValidCommandToken(req)) return;
+      if (!pairing_active) return;
+      #if PAIR_CONFIRM_REQUIRE_CODE
+      if (!req.containsKey("code")) return;
+      int req_code = req["code"].as<int>();
+      if (req_code != pairing_code) return;
+      #else
+      if (req.containsKey("code")) {
+        int req_code = req["code"].as<int>();
+        if (req_code != pairing_code) return;
+      }
+      #endif
+      if (req.containsKey("chat_id")) {
+          const char* new_cid = req["chat_id"];
+          chat_id = String(new_cid);
+          pref.putString("chat_id", chat_id);
+          is_paired = true;
+          pairing_active = false; // Stop beacon
+          publishState(); // Confirm we are online
+          Serial.println("PAIRED via MQTT!");
+      }
+      return; 
+  }
+
+  if (!is_cmd_topic) return;
+  if (!isValidCommandToken(req)) return;
+
+  bool state_changed = false;
+
+  if (req.containsKey("type")) {
+    String type = req["type"].as<String>();
+
+    if (type == "switch" && req.containsKey("id") && req.containsKey("state")) {
+      int switch_num = req["id"];
+      bool val = req["state"].as<int>() == 1;
+      applySwitchState(switch_num, val);
+      state_changed = true;
+    }
+
+    #if ENABLE_FAN
+    else if (type == "fan_power" && req.containsKey("state")) {
+      toggleState_5 = req["state"].as<int>() == 1;
+      if (!toggleState_5) fanSpeedControl(0);
+      else {
+        if (currSpeed <= 0) currSpeed = 1;
+        fanSpeedControl(currSpeed);
+      }
+      pref.putBool("Fan_Power", toggleState_5);
+      my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_5);
+      state_changed = true;
+    } else if (type == "fan_speed" && req.containsKey("speed")) {
+      int new_spd = req["speed"];
+      if (new_spd < 0) new_spd = 0;
+      if (new_spd > 4) new_spd = 4;
+      currSpeed = new_spd;
+      pref.putInt("Fan_Speed", currSpeed);
+      my_fan.updateAndReportParam("My_Speed", currSpeed);
+      if (toggleState_5) fanSpeedControl(currSpeed);
+      state_changed = true;
+    }
+    #endif
+    else if (type == "command" && req.containsKey("cmd")) {
+      String cmd = req["cmd"].as<String>();
+      if (handleCmdString(cmd, req.as<JsonVariantConst>())) state_changed = true;
+    }
+  }
+
+  if (req.containsKey("s") && req.containsKey("v")) {
+    int switch_num = req["s"];
+    bool val = req["v"].as<int>() == 1;
+    applySwitchState(switch_num, val);
+    state_changed = true;
+  } else if (req.containsKey("cmd")) {
+    String cmd = req["cmd"].as<String>();
+    if (handleCmdString(cmd, req.as<JsonVariantConst>())) state_changed = true;
+  }
+
+  if (state_changed) {
+    publishState();
+  }
+}
+
+void tryConnectMqtt() {
+  if (mqtt.connected()) return;
+  if (ESP.getFreeHeap() < SAFE_HEAP_MIN || !bt_killed) return;
+
+  unsigned long now = millis();
+  if (now - last_reconnect_attempt > reconnect_interval) {
+      last_reconnect_attempt = now;
+
+      if (MQTT_REQUIRE_AUTH && (strlen(MQTT_USERNAME) == 0 || strlen(MQTT_PASSWORD) == 0)) {
+          if (reconnect_interval < 30000) reconnect_interval *= 2;
+          return;
+      }
+
+      bool ok = false;
+      if (strlen(MQTT_USERNAME) > 0) {
+          ok = mqtt.connect(mqttClientId, MQTT_USERNAME, MQTT_PASSWORD, topic_online, 1, true, "0");
+      } else {
+          ok = mqtt.connect(mqttClientId, NULL, NULL, topic_online, 1, true, "0");
+      }
+
+      if (ok) {
+          Serial.println("MQTT Connected");
+          reconnect_interval = 1000; // Reset backoff
+
+          // 1. Mark Online (Retained)
+          mqtt.publish(topic_online, (const uint8_t*)"1", 1, true);
+
+          // 2. Subscribe to CMD (for control) AND EVENT (for pairing response)
+          mqtt.subscribe(topic_cmd, 1);
+          mqtt.subscribe(topic_event, 1);
+          
+          publishState();
+          publishHardwareConfigMQTT();
+      } else {
+          // Exponential Backoff (max 30s)
+          if (reconnect_interval < 30000) reconnect_interval *= 2;
+      }
+  }
+}
+
+// ==========================================
+//      WEB SERVER & HELPERS (Same as before)
+// ==========================================
+
+bool is_authenticated() {
+  if (server.hasHeader("Cookie")) {
+    String cookie = server.header("Cookie");
+    if (cookie.indexOf("ESPSESSIONID=1") != -1) return true;
+  }
+  return false;
+}
+
+String getPage() {
+  String note = "";
+  if (server.hasArg("msg")) note = server.arg("msg");
+  String p = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:sans-serif;text-align:center;margin:20px;background:#f4f4f4}.card{background:white;padding:20px;border-radius:10px;box-shadow:0 4px 8px #ddd;margin-bottom:20px}input{padding:10px;margin:5px;border:1px solid #ccc;width:80%}button{padding:10px 20px;border:none;color:white;cursor:pointer;border-radius:5px}.blue{background:#007bff}.red{background:#dc3545}.green{background:#28a745}</style></head><body>";
+  p += "<h1>" + device_name + "</h1>"; 
+  if (note.length() > 0) {
+    p += "<div class='card'><p style='color:#dc3545'>" + note + "</p></div>";
+  }
+  if (is_paired) {
+    p += "<div class='card'><h3 style='color:green'>Paired</h3>";
+    p += "<form action='/rename' method='POST'><input type='text' name='name' value='" + device_name + "'><br><button class='blue'>Update Name</button></form>";
+    p += "<br><form action='/unlink' method='POST'><button class='red'>Unlink Device</button></form></div>";
+  } else {
+    p += "<div class='card'>";
+    if (pairing_active) {
+       p += "<h1 style='color:orange;font-size:40px'>" + String(pairing_code) + "</h1><p>Code expires in " + String((300000 - (millis() - pairing_timer))/1000) + "s</p>";
+       p += "<form action='/stop_pair' method='POST'><button class='red'>Stop Pairing Mode</button></form>";
+    } else {
+       p += "<form action='/start_pair' method='POST'><button class='green'>Start Pairing Mode</button></form>";
+    }
+    p += "</div>";
+  }
+  p += "<div class='card'><h4>Admin Action Password</h4><p>To reboot or factory reset, enter password here. Check manual for more details.</p>";
+  p += "<form action='/admin_action' method='POST'><input type='password' name='password' placeholder='Admin Password'><br>";
+  p += "<button class='blue' name='op' value='reboot' type='submit'>Reboot Device</button> ";
+  p += "<button class='red' name='op' value='reset' type='submit'>Factory Reset</button></form></div></body></html>";
+  return p;
+}
+
+String getLoginPage() {
+  return "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:sans-serif;text-align:center;margin-top:50px;background:#f4f4f4;} .card{background:white;padding:30px;border-radius:10px;box-shadow:0 4px 8px #ddd;display:inline-block;} input{padding:10px;margin:10px;width:200px;border:1px solid #ccc;} button{background:#007bff;color:white;padding:10px 20px;border:none;cursor:pointer;}</style></head><body><div class='card'><h2>Device Login</h2><form action='/login' method='POST'><input type='text' name='user' placeholder='Username'><br><input type='password' name='pass' placeholder='Password'><br><button type='submit'>Login</button></form></div></body></html>";
+}
+
+void handleRoot() {
+  if (!is_authenticated()) { server.send(200, "text/html", getLoginPage()); return; }
+  String stored_chat = pref.getString("chat_id", "");
+  if (stored_chat.length() > 0) {
+    chat_id = stored_chat;
+    is_paired = true;
+    pairing_active = false;
+  }
+  server.send(200, "text/html", getPage());
+}
+
+String urlEncodeSimple(String s) {
+  s.replace("%", "%25");
+  s.replace(" ", "%20");
+  s.replace("+", "%2B");
+  s.replace("&", "%26");
+  s.replace("?", "%3F");
+  s.replace("=", "%3D");
+  return s;
+}
+
+void redirectWithMsg(const String& msg) {
+  server.sendHeader("Location", "/?msg=" + urlEncodeSimple(msg));
+  server.send(302, "text/plain", msg);
+}
+void handleStartPair() {
+  if (!is_authenticated()) return;
+  pairing_code = random(100000, 999999);
+  pairing_active = true;
+  pairing_timer = millis();
+  if (WiFi.status() == WL_CONNECTED && !provisioning_in_progress) {
+    releaseBluetoothResources();
+    tryConnectMqtt();
+  }
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "Pairing Started");
+}
+void handleStopPair() {
+  if (!is_authenticated()) return;
+  pairing_active = false;
+  pairing_code = 0;
+  redirectWithMsg("Pairing stopped.");
+}
+void handleRename() {
+  if (!is_authenticated()) return;
+  if (server.hasArg("name")) {
+      device_name = server.arg("name");
+      device_name.trim();
+      pref.putString("dev_name", device_name);
+      sendRenameEventMQTT();
+  }
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "Renamed");
+}
+void handleLogin() {
+  if (server.hasArg("user") && server.hasArg("pass") && server.arg("user") == PORTAL_USER && server.arg("pass") == PORTAL_PASS) {
+    server.sendHeader("Location", "/");
+    server.sendHeader("Set-Cookie", "ESPSESSIONID=1; Path=/; Max-Age=3600; HttpOnly; SameSite=Strict");
+    server.send(302, "text/plain", "Login Success!"); 
+  } else { server.send(401, "text/plain", "Login Failed"); }
+}
+void handleReboot() {
+  redirectWithMsg("Type password and use the admin action form.");
+}
+void handleReset() {
+  redirectWithMsg("Type password and use the admin action form.");
+}
+void handleAdminAction() {
+  if (!is_authenticated()) return;
+  if (!server.hasArg("password") || server.arg("password") != PORTAL_PASS) {
+    redirectWithMsg("Type password here to reboot or factory reset.");
+    return;
+  }
+  if (!server.hasArg("op")) {
+    redirectWithMsg("Select an admin action.");
+    return;
+  }
+  String op = server.arg("op");
+  if (op == "reboot") {
+    sendMqttLog("Reboot Triggered via Portal");
+    server.send(200, "text/plain", "Rebooting...");
+    delay(300);
+    ESP.restart();
+  } else if (op == "reset") {
+    sendMqttLog("Factory Reset Triggered via Portal");
+    sendResetEventMQTT();
+    delay(100);
+    delay(1000);
+    RMakerFactoryReset(2);
+  } else {
+    redirectWithMsg("Invalid admin action.");
+  }
+}
+void handleUnlink() {
+  if (!is_authenticated()) return;
+  sendMqttLog("Device Unlinked via Portal");
+  pref.remove("chat_id");
+  is_paired = false;
+  pairing_active = false;
+  chat_id = "";
+  sendUnlinkEventMQTT();
+  server.sendHeader("Location", "/"); server.send(302, "text/plain", "Unlinked");
+}
+
+#if ENABLE_FAN
+void applyFanRelaysFinal(int s) {
+   switch(s){
+    case 0: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); break;
+    case 1: digitalWrite(FanRelay1, LOW);  digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); break;
+    case 2: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, LOW);  digitalWrite(FanRelay3, HIGH); break;
+    case 3: digitalWrite(FanRelay1, LOW);  digitalWrite(FanRelay2, LOW);  digitalWrite(FanRelay3, HIGH); break;
+    case 4: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, LOW);  break;
+    default: digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH); break;
+   } 
+}
+
+void fanSpeedControl(int s) {
+  if (s < 0) s = 0;
+  if (s > 4) s = 4;
+  pendingFanSpeed = s;
+
+  if (s == 0) {
+    fanTransitionActive = false;
+    applyFanRelaysFinal(0);
+    return;
+  }
+
+  // Break-before-make without blocking the main loop.
+  digitalWrite(FanRelay1, HIGH); digitalWrite(FanRelay2, HIGH); digitalWrite(FanRelay3, HIGH);
+  fanTransitionStart = millis();
+  fanTransitionActive = true;
+}
+
+void fanService() {
+  if (!fanTransitionActive) return;
+  if (millis() - fanTransitionStart < FAN_SETTLE_MS) return;
+  applyFanRelaysFinal(pendingFanSpeed);
+  fanTransitionActive = false;
+}
+#endif
+
+void write_callback(Device *device, Param *param, const param_val_t val, void *priv_data, write_ctx_t *ctx) {
+  const char *device_name = device->getDeviceName();
+  const char *param_name = param->getParamName();
+
+  if (strcmp(param_name, "Factory Reset") == 0 && val.val.b == true) {
+      param->updateAndReport(val);
+      sendMqttLog("Remote Factory Reset");
+      sendResetEventMQTT();
+      delay(100);
+      delay(1000); RMakerFactoryReset(2);
+  }
+
+  // Update States
+  if(strcmp(device_name, deviceName_1) == 0 && strcmp(param_name, "Power") == 0) {
+      toggleState_1 = val.val.b; digitalWrite(RelayPin1, !toggleState_1); pref.putBool("Relay1", toggleState_1);
+      sendMqttLog("Switch 1 turned " + String(toggleState_1 ? "ON" : "OFF"));
+  } else if(strcmp(device_name, deviceName_2) == 0 && strcmp(param_name, "Power") == 0) {
+      toggleState_2 = val.val.b; digitalWrite(RelayPin2, !toggleState_2); pref.putBool("Relay2", toggleState_2);
+      sendMqttLog("Switch 2 turned " + String(toggleState_2 ? "ON" : "OFF"));
+  } else if(strcmp(device_name, deviceName_3) == 0 && strcmp(param_name, "Power") == 0) {
+      toggleState_3 = val.val.b; digitalWrite(RelayPin3, !toggleState_3); pref.putBool("Relay3", toggleState_3);
+      sendMqttLog("Switch 3 turned " + String(toggleState_3 ? "ON" : "OFF"));
+  } else if(strcmp(device_name, deviceName_4) == 0 && strcmp(param_name, "Power") == 0) {
+      toggleState_4 = val.val.b; digitalWrite(RelayPin4, !toggleState_4); pref.putBool("Relay4", toggleState_4);
+      sendMqttLog("Switch 4 turned " + String(toggleState_4 ? "ON" : "OFF"));
+  }
+  #if ENABLE_FAN
+  else if(strcmp(device_name, deviceName_5) == 0) {
+    if (strcmp(param_name, "Power") == 0) {
+      toggleState_5 = val.val.b; (toggleState_5 == false) ? fanSpeedControl(0) : fanSpeedControl(currSpeed);
+      pref.putBool("Fan_Power", toggleState_5);
+      sendMqttLog("Fan power " + String(toggleState_5 ? "ON" : "OFF"));
+    } else if (strcmp(param_name, "My_Speed") == 0 || strcmp(param_name, "Speed") == 0) {
+      currSpeed = val.val.i; if(toggleState_5 == 1) fanSpeedControl(currSpeed);
+      pref.putInt("Fan_Speed", currSpeed);
+      sendMqttLog("Fan speed set to " + String(currSpeed));
+    }
+  }
+  #endif
+  
+  param->updateAndReport(val);
+  publishState();
+}
+
+void sysProvEvent(arduino_event_t *sys_event) {
+    switch (sys_event->event_id) {      
+        case ARDUINO_EVENT_PROV_START: 
+            provisioning_in_progress = true;
+            break;
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED: digitalWrite(wifiLed, true); break;
+        case ARDUINO_EVENT_PROV_CRED_SUCCESS: break;
+        case ARDUINO_EVENT_PROV_END:
+            provisioning_in_progress = false;
+            break;
+        case ARDUINO_EVENT_PROV_DEINIT:
+            provisioning_in_progress = false;
+            break;
+        case ARDUINO_EVENT_PROV_CRED_FAIL: digitalWrite(wifiLed, false); break;
+    }
+}
+
+// ==========================================
+//      SETUP & LOOP
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  pref.begin("Relay_State", false);
+  
+  esp_task_wdt_init(WDT_TIMEOUT, true); esp_task_wdt_add(NULL); 
+  
+  device_id = WiFi.macAddress(); device_id.replace(":", "");
+  snprintf(mqttClientId, sizeof(mqttClientId), "smarthome-%s", device_id.c_str());
+  buildMqttTopics();
+  chat_id = pref.getString("chat_id", "");
+  device_name = pref.getString("dev_name", "Smart Device"); 
+  if (chat_id.length() > 0) is_paired = true;
+  
+  #if MQTT_USE_TLS
+  if (strlen(MQTT_CA_CERT) > 0) mqttNetClient.setCACert(MQTT_CA_CERT);
+  else mqttNetClient.setInsecure();
+  #endif
+
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setKeepAlive(45);
+  mqtt.setSocketTimeout(3);
+  mqtt.setBufferSize(MQTT_RXTX_BUFFER_SIZE);
+  mqtt.setCallback(mqttCallback);
+
+  initRelayOutputsSafeOff();
+  pinMode(wifiLed, OUTPUT);
+  pinMode(SwitchPin1, INPUT_PULLUP); pinMode(SwitchPin2, INPUT_PULLUP); pinMode(SwitchPin3, INPUT_PULLUP); pinMode(SwitchPin4, INPUT_PULLUP);
+  #if ENABLE_FAN
+  pinMode(FanSwitch1, INPUT_PULLUP); pinMode(FanSwitch2, INPUT_PULLUP); pinMode(FanSwitch3, INPUT_PULLUP); pinMode(FanSwitch4, INPUT_PULLUP);
+  #endif
+  pinMode(gpio_reset, INPUT_PULLUP); 
+  
+  RMaker.setTimeSync(true);
+  my_node = RMaker.initNode(nodeName);
+  my_node.addNodeAttr("fw_version", RMAKER_FW_VERSION);
+  my_node.addNodeAttr("model", RMAKER_MODEL);
+  my_switch1.addCb(write_callback); Param resetParam("Factory Reset", ESP_RMAKER_PARAM_TOGGLE, value(false), PROP_FLAG_READ | PROP_FLAG_WRITE); resetParam.addUIType(ESP_RMAKER_UI_TOGGLE); my_switch1.addParam(resetParam); my_node.addDevice(my_switch1);
+  my_switch2.addCb(write_callback); my_node.addDevice(my_switch2);
+  my_switch3.addCb(write_callback); my_node.addDevice(my_switch3); 
+  my_switch4.addCb(write_callback); my_node.addDevice(my_switch4);
+  #if ENABLE_FAN
+  my_fan.addCb(write_callback);
+  Param speed("My_Speed", ESP_RMAKER_PARAM_RANGE, value(0), PROP_FLAG_READ | PROP_FLAG_WRITE);
+  speed.addBounds(value(0), value(4), value(1));
+  speed.addUIType(ESP_RMAKER_UI_SLIDER);
+  my_fan.addParam(speed);
+  my_node.addDevice(my_fan);
+  #endif
+
+  applyBootRelayStateWithoutFlicker();
+
+  #if ENABLE_FAN
+    currSpeed = pref.getInt("Fan_Speed", 0); 
+    my_fan.updateAndReportParam("My_Speed", currSpeed);
+    toggleState_5 = pref.getBool("Fan_Power", 0);
+    if (toggleState_5 && currSpeed > 0) fanSpeedControl(currSpeed);
+    else fanSpeedControl(0);
+    my_fan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_5);
+  #endif
+
+  esp_err_t ota_err = RMaker.enableOTA(OTA_USING_TOPICS);
+  if (ota_err != ESP_OK) {
+    Serial.printf("RainMaker OTA enable failed: %d\n", ota_err);
+  }
+  esp_event_handler_register(RMAKER_OTA_EVENT, ESP_EVENT_ANY_ID, &otaEventHandler, NULL);
+
+  publishState();
+
+  RMaker.start();
+  WiFi.onEvent(sysProvEvent); 
+  WiFiProv.beginProvision(WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BTDM, WIFI_PROV_SECURITY_1, pop, service_name);
+
+  const char *headerkeys[] = {"Cookie"}; size_t headerkeyssize = sizeof(headerkeys) / sizeof(char*); server.collectHeaders(headerkeys, headerkeyssize); 
+  server.on("/", handleRoot);
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/start_pair", HTTP_POST, handleStartPair);
+  server.on("/stop_pair", HTTP_POST, handleStopPair);
+  server.on("/rename", HTTP_POST, handleRename);
+  server.on("/admin_action", HTTP_POST, handleAdminAction);
+  server.on("/reboot", HTTP_POST, handleReboot);
+  server.on("/reset", HTTP_POST, handleReset);
+  server.on("/unlink", HTTP_POST, handleUnlink);
+  server.onNotFound([](){ server.send(404, "text/plain", "Not Found"); });
+  server.begin();
+}
+
+void loop() {  
+  esp_task_wdt_reset(); 
+  server.handleClient();
+  pollRockerSwitches();
+  
+  if(digitalRead(gpio_reset) == LOW) { delay(100); int start = millis(); while(digitalRead(gpio_reset)==LOW) delay(50);
+    if((millis()-start)>10000) { RMakerFactoryReset(2); } else if((millis()-start)>3000) { RMakerWiFiReset(2); } }
+
+  if (WiFi.status() == WL_CONNECTED) { 
+    digitalWrite(wifiLed, true);
+
+    if (!mdns_started) {
+      if (MDNS.begin(MDNS_HOSTNAME)) {
+        MDNS.addService("http", "tcp", 80);
+        mdns_started = true;
+        Serial.printf("Portal URL: http://%s.local/\n", MDNS_HOSTNAME);
+      }
+    }
+    
+    // 1. RAM Manager: Never kill BT while RainMaker provisioning is in progress
+    if (wifi_connect_time == 0) wifi_connect_time = millis();
+    if (!provisioning_in_progress && !bt_killed && (pairing_active || (millis() - wifi_connect_time > BT_RELEASE_DELAY_MS))) {
+        releaseBluetoothResources();
+    }
+
+    // 2. Process MQTT Connections and Messages (Non-blocking)
+    if (!ota_in_progress && !provisioning_in_progress && bt_killed) {
+        if (!mqtt.connected()) {
+            tryConnectMqtt();
+        } else {
+            mqtt.loop(); 
+        }
+    }
+
+    // 3. PAIRING BEACON
+    if (!is_paired && pairing_active) {
+       if (millis() - pairing_timer > 300000) pairing_active = false;
+       else if (millis() - last_beacon > 5000) { 
+           sendPairingBeaconMQTT();
+           last_beacon = millis();
+       }
+    }
+  } else {
+    digitalWrite(wifiLed, false); wifi_connect_time = 0;
+    if (mdns_started) {
+      MDNS.end();
+      mdns_started = false;
+    }
+  }
+  #if ENABLE_FAN
+  fanService();
+  #endif
+  delay(2);
+}
